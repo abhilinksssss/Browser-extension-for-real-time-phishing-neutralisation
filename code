@@ -1,0 +1,94 @@
+# train_phish_model.py
+import re
+import numpy as np
+import pandas as pd
+from urllib.parse import urlparse
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# ---------- Feature extraction ----------
+def is_ip(host):
+    return 1 if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', host) else 0
+
+def count_digits(s):
+    return sum(c.isdigit() for c in s)
+
+def count_special(s):
+    return sum(1 for c in s if c in "-_@?=&%$")
+
+def has_https(url):
+    return 1 if url.lower().startswith('https://') else 0
+
+def url_features(url):
+    # parse
+    try:
+        p = urlparse(url)
+        host = p.hostname or ''
+        path = p.path or ''
+    except:
+        host = ''
+        path = ''
+    features = {}
+    features['url_len'] = len(url)
+    features['host_len'] = len(host)
+    features['path_len'] = len(path)
+    features['count_dots'] = host.count('.')
+    features['count_hyphen'] = host.count('-')
+    features['count_at'] = url.count('@')
+    features['is_ip'] = is_ip(host)
+    features['count_digits'] = count_digits(url)
+    features['count_special'] = count_special(url)
+    features['has_https'] = has_https(url)
+    # suspicious keywords often used in phishing
+    suspicious = ['login', 'verify', 'account', 'update', 'secure', 'bank', 'confirm', 'signin', 'ebay', 'paypal']
+    features['suspicious_words'] = sum(1 for w in suspicious if w in url.lower())
+    return np.array([features[k] for k in sorted(features.keys())], dtype=float)
+
+# ---------- Load dataset ----------
+# Expect CSV with columns: url,label (label: 1 for phishing, 0 for benign)
+# If you don't have a dataset, search for "Phishing URLs" datasets (Kaggle) and prepare csv.
+df = pd.read_csv('urls_dataset.csv')  # user provides dataset
+df = df.dropna(subset=['url', 'label'])
+X = np.stack(df['url'].apply(url_features).values)
+y = df['label'].astype(int).values
+
+# ---------- Scale ----------
+scaler = StandardScaler().fit(X)
+Xs = scaler.transform(X)
+
+# Save scaler parameters for JS (mean + scale)
+np.savez('scaler_stats.npz', mean=scaler.mean_, scale=scaler.scale_)
+
+# ---------- Train-test split ----------
+X_train, X_test, y_train, y_test = train_test_split(Xs, y, test_size=0.2, random_state=42, stratify=y)
+
+# ---------- Model ----------
+def make_model(input_dim):
+    model = models.Sequential([
+        layers.Input(shape=(input_dim,)),
+        layers.Dense(32, activation='relu'),
+        layers.Dropout(0.2),
+        layers.Dense(16, activation='relu'),
+        layers.Dense(1, activation='sigmoid')
+    ])
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+model = make_model(X_train.shape[1])
+model.summary()
+
+# ---------- Train ----------
+model.fit(X_train, y_train, epochs=15, batch_size=128, validation_split=0.1)
+
+# ---------- Evaluate ----------
+loss, acc = model.evaluate(X_test, y_test, verbose=0)
+print(f"Test acc: {acc:.4f}, loss: {loss:.4f}")
+
+# ---------- Save Keras model as SavedModel ----------
+import os
+if not os.path.exists('saved_model'):
+    os.makedirs('saved_model')
+model.save('saved_model/linear_phish_detector')  # SavedModel dir
+print("Saved Keras model to saved_model/linear_phish_detector")
